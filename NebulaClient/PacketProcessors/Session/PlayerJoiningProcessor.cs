@@ -3,7 +3,6 @@ using NebulaModel.Networking;
 using NebulaModel.Packets.Processors;
 using NebulaModel.Packets.Session;
 using NebulaWorld;
-using System.Reflection;
 
 namespace NebulaClient.PacketProcessors.Session
 {
@@ -13,7 +12,7 @@ namespace NebulaClient.PacketProcessors.Session
         public void ProcessPacket(PlayerJoining packet, NebulaConnection conn)
         {
             SimulatedWorld.SpawnRemotePlayerModel(packet.PlayerData);
-            typeof(GameMain).GetField("_paused", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(GameMain.instance, true);
+            GameMain.Pause();
             InGamePopup.ShowInfo("Loading", "Player joining the game, please wait", null);
         }
     }

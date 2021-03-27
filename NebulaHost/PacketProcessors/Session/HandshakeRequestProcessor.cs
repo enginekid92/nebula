@@ -5,7 +5,6 @@ using NebulaModel.Packets.Processors;
 using NebulaModel.Packets.Session;
 using NebulaWorld;
 using System.Linq;
-using System.Reflection;
 
 namespace NebulaHost.PacketProcessors.Session
 {
@@ -37,7 +36,7 @@ namespace NebulaHost.PacketProcessors.Session
             }
 
             //
-            typeof(GameMain).GetField("_paused", BindingFlags.Instance | BindingFlags.NonPublic).SetValue(GameMain.instance, true);
+            GameMain.Pause();
             InGamePopup.ShowInfo("Loading", "Player joining the game, please wait", null);
 
             // Make sure that each player that is currently in the game receives that a new player as join so they can create its RemotePlayerCharacter
