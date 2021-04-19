@@ -6,6 +6,7 @@ using NebulaModel.Packets.Routers;
 using NebulaModel.Packets.Session;
 using NebulaModel.Utils;
 using NebulaWorld;
+using System;
 using System.Net;
 using UnityEngine;
 using WebSocketSharp;
@@ -81,6 +82,16 @@ namespace NebulaClient
         {
             serverConnection?.SendPacket(new StarBroadcastPacket(PacketProcessor.Write(packet), GameMain.data.localStar?.id ?? -1));
         }
+        public void SendPacketToLocalPlanet<T>(T packet) where T : class, new()
+        {
+            serverConnection?.SendPacket(new PlanetBroadcastPacket(PacketProcessor.Write(packet), GameMain.mainPlayer.planetId));
+        }
+        public void SendPacketToPlanet<T>(T packet, int planetId) where T : class, new()
+        {
+            //Should send packet to particular planet
+            //Not needed at the moment, used only on the host side
+            throw new NotImplementedException();
+        }
 
         public void Reconnect()
         {
@@ -100,7 +111,7 @@ namespace NebulaClient
             serverConnection = new NebulaConnection(clientSocket, serverEndpoint, PacketProcessor);
             IsConnected = true;
             //TODO: Maybe some challenge-response authentication mechanism?
-            SendPacket(new HandshakeRequest(CryptoUtils.GetPublicKey(CryptoUtils.GetOrCreateUserCert()), GameMain.data.account.userName));
+            SendPacket(new HandshakeRequest(CryptoUtils.GetPublicKey(CryptoUtils.GetOrCreateUserCert()), AccountData.me.userName));
         }
 
         private void ClientSocket_OnClose(object sender, CloseEventArgs e)

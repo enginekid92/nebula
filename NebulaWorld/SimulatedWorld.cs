@@ -6,6 +6,8 @@ using NebulaModel.Packets.Players;
 using NebulaModel.Packets.Trash;
 using NebulaWorld.Factory;
 using NebulaWorld.MonoBehaviours.Remote;
+using NebulaWorld.Planet;
+using NebulaWorld.Player;
 using NebulaWorld.Trash;
 using System.Collections.Generic;
 using UnityEngine;
@@ -19,17 +21,32 @@ namespace NebulaWorld
     /// </summary>
     public static class SimulatedWorld
     {
-        static Dictionary<ushort, RemotePlayerModel> remotePlayersModels;
+        sealed class ThreadSafe
+        {
+            internal readonly Dictionary<ushort, RemotePlayerModel> remotePlayersModels = new Dictionary<ushort, RemotePlayerModel>();
+        }
+
+        private static readonly ThreadSafe threadSafe = new ThreadSafe();
+
+        public static Locker GetRemotePlayersModels(out Dictionary<ushort, RemotePlayerModel> remotePlayersModels) =>
+            threadSafe.remotePlayersModels.GetLocked(out remotePlayersModels);
 
         public static bool Initialized { get; private set; }
         public static bool IsGameLoaded { get; private set; }
         public static bool IsPlayerJoining { get; set; }
+        public static bool ExitingMultiplayerSession { get; set; }
 
         public static void Initialize()
         {
             FactoryManager.Initialize();
-            remotePlayersModels = new Dictionary<ushort, RemotePlayerModel>();
+            PlanetManager.Initialize();
             Initialized = true;
+            ExitingMultiplayerSession = false;
+
+            using (GetRemotePlayersModels(out var remotePlayersModels))
+            {
+                remotePlayersModels.Clear();
+            }
         }
 
         /// <summary>
@@ -37,12 +54,16 @@ namespace NebulaWorld
         /// </summary>
         public static void Clear()
         {
-            foreach (var model in remotePlayersModels.Values)
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                model.Destroy();
+                foreach (var model in remotePlayersModels.Values)
+                {
+                    model.Destroy();
+                }
+
+                remotePlayersModels.Clear();
             }
 
-            remotePlayersModels.Clear();
             Initialized = false;
             IsGameLoaded = false;
             IsPlayerJoining = false;
@@ -77,10 +98,13 @@ namespace NebulaWorld
 
         public static void SpawnRemotePlayerModel(PlayerData playerData)
         {
-            if (!remotePlayersModels.ContainsKey(playerData.PlayerId))
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                RemotePlayerModel model = new RemotePlayerModel(playerData.PlayerId, playerData.Username);
-                remotePlayersModels.Add(playerData.PlayerId, model);
+                if (!remotePlayersModels.ContainsKey(playerData.PlayerId))
+                {
+                    RemotePlayerModel model = new RemotePlayerModel(playerData.PlayerId, playerData.Username);
+                    remotePlayersModels.Add(playerData.PlayerId, model);
+                }
             }
 
             UpdatePlayerColor(playerData.PlayerId, playerData.Color);
@@ -88,98 +112,194 @@ namespace NebulaWorld
 
         public static void DestroyRemotePlayerModel(ushort playerId)
         {
-            if (remotePlayersModels.TryGetValue(playerId, out RemotePlayerModel player))
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                player.Destroy();
-                remotePlayersModels.Remove(playerId);
+                if (remotePlayersModels.TryGetValue(playerId, out RemotePlayerModel player))
+                {
+                    player.Destroy();
+                    remotePlayersModels.Remove(playerId);
+                }
             }
         }
 
         public static void UpdateRemotePlayerPosition(PlayerMovement packet)
         {
-            if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                player.Movement.UpdatePosition(packet);
+                if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
+                {
+                    player.Movement.UpdatePosition(packet);
+                }
             }
         }
 
         public static void UpdateRemotePlayerAnimation(PlayerAnimationUpdate packet)
         {
-            if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                player.Animator.UpdateState(packet);
-                player.Effects.UpdateState(packet);
+                if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
+                {
+                    player.Animator.UpdateState(packet);
+                    player.Effects.UpdateState(packet);
+                }
+            }
+        }
+
+        public static void UpdateRemotePlayerDrone(NewDroneOrderPacket packet)
+        {
+            using (GetRemotePlayersModels(out var remotePlayersModels))
+            {
+                if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
+                {
+                    //Setup drone of remote player based on the drone data
+                    ref MechaDrone drone = ref player.PlayerInstance.mecha.drones[packet.DroneId];
+                    MechaDroneLogic droneLogic = player.PlayerInstance.mecha.droneLogic;
+
+                    drone.stage = packet.Stage;
+                    drone.targetObject = packet.Stage < 3 ? packet.EntityId : 0;
+                    drone.movement = droneLogic.player.mecha.droneMovement;
+                    if (packet.Stage == 1)
+                    {
+                        drone.position = player.Movement.GetLastPosition().LocalPlanetPosition.ToVector3();
+                    }
+                    drone.target = (Vector3)MethodInvoker.GetHandler(AccessTools.Method(typeof(MechaDroneLogic), "_obj_hpos", new System.Type[] { typeof(int) })).Invoke(GameMain.mainPlayer.mecha.droneLogic, packet.EntityId);
+                    drone.initialVector = drone.position + drone.position.normalized * 4.5f + ((drone.target - drone.position).normalized + UnityEngine.Random.insideUnitSphere) * 1.5f;
+                    drone.forward = drone.initialVector;
+                    drone.progress = 0f;
+                    player.MechaInstance.droneCount = GameMain.mainPlayer.mecha.droneCount;
+                    player.MechaInstance.droneSpeed = GameMain.mainPlayer.mecha.droneSpeed;
+                    Mecha myMecha = GameMain.mainPlayer.mecha;
+                    if (packet.Stage == 3)
+                    {
+                        myMecha.droneLogic.serving.Remove(packet.EntityId);
+                    }
+
+                    if (drone.stage == 1 || drone.stage == 2)
+                    {
+                        //Check if my drone is already going there
+                        if (!myMecha.droneLogic.serving.Contains(packet.EntityId))
+                        {
+                            myMecha.droneLogic.serving.Add(packet.EntityId);
+                        }
+                        else
+                        {
+                            //resolve conflict (two drones are going to the same building)
+                            //find my drone that is going there
+                            int priority = 0;
+                            int droneId = 0;
+                            for (int i = 0; i < myMecha.droneCount; i++)
+                            {
+                                if (myMecha.drones[i].stage > 0 && myMecha.drones[i].targetObject == drone.targetObject)
+                                {
+                                    priority = DroneManager.DronePriorities[i];
+                                    droneId = i;
+                                    break;
+                                }
+                            }
+                            //compare, who's drone has higher priority
+                            if (packet.Priority > priority)
+                            {
+                                //their drone won, my drone has to return
+                                ref MechaDrone myDrone = ref myMecha.drones[droneId];
+                                myDrone.stage = 3;
+                                myDrone.targetObject = 0;
+                            }
+                            else
+                            {
+                                //my drone won, their has to return
+                                drone.stage = 3;
+                                drone.targetObject = 0;
+                            }
+                        }
+                    }
+                }
             }
         }
 
         public static void UpdatePlayerColor(ushort playerId, Float3 color)
         {
-            Transform transform;
-            RemotePlayerModel remotePlayerModel;
-            if (playerId == LocalPlayer.PlayerId)
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                transform = GameMain.data.mainPlayer.transform;
-            }
-            else if (remotePlayersModels.TryGetValue(playerId, out remotePlayerModel))
-            {
-                transform = remotePlayerModel.PlayerTransform;
-            }
-            else
-            {
-                Log.Error("Could not find the transform for player with ID " + playerId);
-                return;
-            }
-
-            Log.Info($"Changing color of player {playerId} to {color}");
-
-            // Apply new color to each part of the mecha
-            SkinnedMeshRenderer[] componentsInChildren = transform.gameObject.GetComponentsInChildren<SkinnedMeshRenderer>();
-            foreach (Renderer r in componentsInChildren)
-            {
-                if (r.material?.name.StartsWith("icarus-armor") ?? false)
+                Transform transform;
+                RemotePlayerModel remotePlayerModel;
+                if (playerId == LocalPlayer.PlayerId)
                 {
-                    r.material.SetColor("_Color", color.ToColor());
+                    transform = GameMain.data.mainPlayer.transform;
                 }
-            }
+                else if (remotePlayersModels.TryGetValue(playerId, out remotePlayerModel))
+                {
+                    transform = remotePlayerModel.PlayerTransform;
+                }
+                else
+                {
+                    Log.Error("Could not find the transform for player with ID " + playerId);
+                    return;
+                }
 
-            // We changed our own color, so we have to let others know
-            if (LocalPlayer.PlayerId == playerId)
-            {
-                LocalPlayer.SendPacket(new PlayerColorChanged(playerId, color));
+                Log.Info($"Changing color of player {playerId} to {color}");
+
+                // Apply new color to each part of the mecha
+                SkinnedMeshRenderer[] componentsInChildren = transform.gameObject.GetComponentsInChildren<SkinnedMeshRenderer>();
+                foreach (Renderer r in componentsInChildren)
+                {
+                    if (r.material?.name.StartsWith("icarus-armor", System.StringComparison.Ordinal) ?? false)
+                    {
+                        r.material.SetColor("_Color", color.ToColor());
+                    }
+                }
+
+                // We changed our own color, so we have to let others know
+                if (LocalPlayer.PlayerId == playerId)
+                {
+                    LocalPlayer.SendPacket(new PlayerColorChanged(playerId, color));
+                }
             }
         }
 
         public static void MineVegetable(VegeMined packet)
         {
-            if (!remotePlayersModels.TryGetValue((ushort)packet.PlayerId, out RemotePlayerModel pModel))
+            int localPlanetId = -1;
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                Debug.Log("FAILED TO SYNC VEGE DATA");
+                if (remotePlayersModels.TryGetValue((ushort)packet.PlayerId, out RemotePlayerModel pModel))
+                {
+                    localPlanetId = pModel.Movement.localPlanetId;
+                }
+                else
+                {
+                    Debug.LogWarning("FAILED TO SYNC VEGE DATA");
+                }
             }
-            PlanetData planet = GameMain.galaxy?.PlanetById(pModel.Movement.localPlanetId);
-            if (planet == null)
+
+            if (localPlanetId == -1)
+                return;
+
+            PlanetData planet = GameMain.galaxy?.PlanetById(localPlanetId);
+            PlanetFactory factory = planet?.factory;
+            if (planet == null || factory == null)
                 return;
 
             if (packet.isVegetable) // Trees, rocks, leaves, etc
             {
-                VegeData vData = (VegeData)planet.factory?.GetVegeData(packet.MiningID);
+                VegeData vData = (VegeData)factory.GetVegeData(packet.MiningID);
                 VegeProto vProto = LDB.veges.Select((int)vData.protoId);
                 if (vProto != null && planet.id == GameMain.localPlanet?.id)
                 {
                     VFEffectEmitter.Emit(vProto.MiningEffect, vData.pos, vData.rot);
                     VFAudio.Create(vProto.MiningAudio, null, vData.pos, true);
                 }
-                planet.factory?.RemoveVegeWithComponents(vData.id);
+                factory.RemoveVegeWithComponents(vData.id);
             }
             else // veins
             {
-                VeinData vData = (VeinData)planet.factory?.GetVeinData(packet.MiningID);
+                VeinData vData = (VeinData)factory.GetVeinData(packet.MiningID);
                 VeinProto vProto = LDB.veins.Select((int)vData.type);
                 if (vProto != null)
                 {
-                    if (planet.factory?.veinPool[packet.MiningID].amount > 0)
+                    if (factory.veinPool[packet.MiningID].amount > 0)
                     {
-                        VeinData[] vPool = planet.factory?.veinPool;
-                        PlanetData.VeinGroup[] vGroups = planet.factory?.planet.veinGroups;
+                        VeinData[] vPool = factory.veinPool;
+                        PlanetData.VeinGroup[] vGroups = factory.planet.veinGroups;
                         long[] vAmounts = planet.veinAmounts;
                         vPool[packet.MiningID].amount -= 1;
                         vGroups[(int)vData.groupIndex].amount -= 1;
@@ -193,7 +313,7 @@ namespace NebulaWorld
                     }
                     else
                     {
-                        PlanetData.VeinGroup[] vGroups = planet.factory?.planet.veinGroups;
+                        PlanetData.VeinGroup[] vGroups = factory.planet.veinGroups;
                         vGroups[vData.groupIndex].count -= 1;
 
                         if (planet.id == GameMain.localPlanet?.id)
@@ -202,7 +322,7 @@ namespace NebulaWorld
                             VFAudio.Create(vProto.MiningAudio, null, vData.pos, true);
                         }
 
-                        planet.factory?.RemoveVeinWithComponents(vData.id);
+                        factory.RemoveVeinWithComponents(vData.id);
                     }
                 }
             }
@@ -210,27 +330,33 @@ namespace NebulaWorld
 
         public static int GenerateTrashOnPlayer(TrashSystemNewTrashCreatedPacket packet)
         {
-            if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                TrashData trashData = packet.GetTrashData();
-                //Calculate trash position based on the current player's model position
-                RemotePlayerMovement.Snapshot lastPosition = player.Movement.GetLastPosition();
-                if (lastPosition.LocalPlanetId < 1)
+                if (remotePlayersModels.TryGetValue(packet.PlayerId, out RemotePlayerModel player))
                 {
-                    trashData.uPos = new VectorLF3(lastPosition.UPosition.x, lastPosition.UPosition.y, lastPosition.UPosition.z);
-                } else
-                {
-                    trashData.lPos = lastPosition.LocalPlanetPosition.ToVector3();
-                    PlanetData planet = GameMain.galaxy.PlanetById(lastPosition.LocalPlanetId);
-                    trashData.uPos = planet.uPosition + (VectorLF3)Maths.QRotate(planet.runtimeRotation, trashData.lPos);
+                    TrashData trashData = packet.GetTrashData();
+                    //Calculate trash position based on the current player's model position
+                    RemotePlayerMovement.Snapshot lastPosition = player.Movement.GetLastPosition();
+                    if (lastPosition.LocalPlanetId < 1)
+                    {
+                        trashData.uPos = new VectorLF3(lastPosition.UPosition.x, lastPosition.UPosition.y, lastPosition.UPosition.z);
+                    }
+                    else
+                    {
+                        trashData.lPos = lastPosition.LocalPlanetPosition.ToVector3();
+                        PlanetData planet = GameMain.galaxy.PlanetById(lastPosition.LocalPlanetId);
+                        trashData.uPos = planet.uPosition + (VectorLF3)Maths.QRotate(planet.runtimeRotation, trashData.lPos);
+                    }
+
+                    using (TrashManager.NewTrashFromOtherPlayers.On())
+                    {
+                        int myId = GameMain.data.trashSystem.container.NewTrash(packet.GetTrashObject(), trashData);
+
+                        return myId;
+                    }
                 }
-
-                TrashManager.NewTrashFromOtherPlayers = true;
-                int myId = GameMain.data.trashSystem.container.NewTrash(packet.GetTrashObject(), trashData);
-                TrashManager.NewTrashFromOtherPlayers = false;
-
-                return myId;
             }
+
             return 0;
         }
 
@@ -261,7 +387,7 @@ namespace NebulaWorld
                 GameMain.mainPlayer.uRotation = Quaternion.Euler(LocalPlayer.Data.Rotation.ToVector3());
 
                 //Load player's saved data from the last session.
-                AccessTools.Property(typeof(Player), "package").SetValue(GameMain.mainPlayer, LocalPlayer.Data.Mecha.Inventory, null);
+                AccessTools.Property(typeof(global::Player), "package").SetValue(GameMain.mainPlayer, LocalPlayer.Data.Mecha.Inventory, null);
                 GameMain.mainPlayer.mecha.forge = LocalPlayer.Data.Mecha.Forge;
                 GameMain.mainPlayer.mecha.coreEnergy = LocalPlayer.Data.Mecha.CoreEnergy;
                 GameMain.mainPlayer.mecha.reactorEnergy = LocalPlayer.Data.Mecha.ReactorEnergy;
@@ -272,8 +398,11 @@ namespace NebulaWorld
                 AccessTools.Property(typeof(MechaForge), "mecha").SetValue(GameMain.mainPlayer.mecha.forge, GameMain.mainPlayer.mecha, null);
                 AccessTools.Property(typeof(MechaForge), "player").SetValue(GameMain.mainPlayer.mecha.forge, GameMain.mainPlayer, null);
                 GameMain.mainPlayer.mecha.forge.gameHistory = GameMain.data.history;
+            }
 
-                //Update player's Mecha tech bonuses
+            //Update player's Mecha tech bonuses
+            if (!LocalPlayer.IsMasterClient)
+            {
                 LocalPlayer.Data.Mecha.TechBonuses.UpdateMech(GameMain.mainPlayer.mecha);
             }
 
@@ -284,31 +413,46 @@ namespace NebulaWorld
 
         public static void OnDronesDraw()
         {
-            foreach(KeyValuePair<ushort, RemotePlayerModel> remoteModel in remotePlayersModels)
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                remoteModel.Value.MechaInstance.droneRenderer.Draw();
+                foreach (KeyValuePair<ushort, RemotePlayerModel> remoteModel in remotePlayersModels)
+                {
+                    //Render drones of players only on the local planet
+                    if (GameMain.mainPlayer.planetId == remoteModel.Value.Movement.localPlanetId)
+                    {
+                        remoteModel.Value.MechaInstance.droneRenderer.Draw();
+                    }
+                }
             }
         }
 
         public static void OnDronesGameTick(long time, float dt)
         {
-            double tmp = 0;
-            double tmp2 = 0;
-            //Update drones positions based on their targets
-            foreach (KeyValuePair<ushort, RemotePlayerModel> remoteModel in remotePlayersModels)
+            double tmp = 1e10; //fake energy of remote player, needed to do the Update()
+            double tmp2 = 1;
+
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                MechaDrone[] drones = remoteModel.Value.PlayerInstance.mecha.drones;
-                int droneCount = remoteModel.Value.PlayerInstance.mecha.droneCount;
-                for (int i = 0; i < droneCount; i++)
+                //Update drones positions based on their targets
+                var prebuildPool = GameMain.localPlanet?.factory?.prebuildPool;
+
+                foreach (KeyValuePair<ushort, RemotePlayerModel> remoteModel in remotePlayersModels)
                 {
-                    if (drones[i].stage != 0)
+                    Mecha remoteMecha = remoteModel.Value.MechaInstance;
+                    MechaDrone[] drones = remoteMecha.drones;
+                    int droneCount = remoteMecha.droneCount;
+                    var remotePosition = remoteModel.Value.Movement.GetLastPosition().LocalPlanetPosition.ToVector3();
+
+                    for (int i = 0; i < droneCount; i++)
                     {
-                        //To-do: fix the correct factory here
-                        //To-do: Optimize getting local position of player
-                        drones[i].Update(GameMain.localPlanet.factory.prebuildPool, remoteModel.Value.Movement.GetLastPosition().LocalPlanetPosition.ToVector3(), dt, ref tmp, ref tmp2, 0);
+                        //Update only moving drones of players on the same planet
+                        if (drones[i].stage != 0 && GameMain.mainPlayer.planetId == remoteModel.Value.Movement.localPlanetId)
+                        {
+                            drones[i].Update(prebuildPool, remotePosition, dt, ref tmp, ref tmp2, 0);
+                        }
                     }
+                    remoteMecha.droneRenderer.Update();
                 }
-                remoteModel.Value.MechaInstance.droneRenderer.Update();
             }
         }
 
@@ -317,78 +461,84 @@ namespace NebulaWorld
             // Make a copy of the "Icarus" text from the starmap
             Text starmap_playerNameText = (Text)AccessTools.Field(typeof(UIStarmap), "playerNameText").GetValue(starmap);
 
-            foreach (var player in remotePlayersModels)
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                RemotePlayerModel playerModel = player.Value;
-
-                Text nameText;
-                Text starmapMarker;
-                if (playerModel.StarmapNameText != null && playerModel.StarmapMarker != null)
+                foreach (var player in remotePlayersModels)
                 {
-                    nameText = playerModel.StarmapNameText;
-                    starmapMarker = playerModel.StarmapMarker;
-                }
-                else
-                {
-                    // Make an instance of the "Icarus" text to represent the other player name
-                    nameText = playerModel.StarmapNameText = GameObject.Instantiate(starmap_playerNameText, starmap_playerNameText.transform.parent);
-                    nameText.text = $"{ playerModel.Username }{ playerModel.PlayerId }";
-                    nameText.gameObject.SetActive(true);
+                    RemotePlayerModel playerModel = player.Value;
 
-                    // Make another copy of it, but just replace it with a point to represent their location
-                    starmapMarker = playerModel.StarmapMarker = GameObject.Instantiate(starmap_playerNameText, starmap_playerNameText.transform.parent);
-                    starmapMarker.text = "•";
-                    starmapMarker.fontSize = nameText.fontSize * 4;
-                    starmapMarker.gameObject.SetActive(true);
-                }
+                    Text nameText;
+                    Text starmapMarker;
+                    if (playerModel.StarmapNameText != null && playerModel.StarmapMarker != null)
+                    {
+                        nameText = playerModel.StarmapNameText;
+                        starmapMarker = playerModel.StarmapMarker;
+                    }
+                    else
+                    {
+                        // Make an instance of the "Icarus" text to represent the other player name
+                        nameText = playerModel.StarmapNameText = GameObject.Instantiate(starmap_playerNameText, starmap_playerNameText.transform.parent);
+                        nameText.text = $"{ playerModel.Username }{ playerModel.PlayerId }";
+                        nameText.gameObject.SetActive(true);
 
-                VectorLF3 adjustedVector;
-                if (playerModel.Movement.localPlanetId > 0)
-                {
-                    // Get the position of the planet
-                    PlanetData planet = GameMain.galaxy.PlanetById(playerModel.Movement.localPlanetId);
-                    adjustedVector = planet.uPosition;
+                        // Make another copy of it, but just replace it with a point to represent their location
+                        starmapMarker = playerModel.StarmapMarker = GameObject.Instantiate(starmap_playerNameText, starmap_playerNameText.transform.parent);
+                        starmapMarker.text = "•";
+                        starmapMarker.fontSize = nameText.fontSize * 4;
+                        starmapMarker.gameObject.SetActive(true);
+                    }
 
-                    // Add the local position of the player
-                    Vector3 localPlanetPosition = playerModel.Movement.GetLastPosition().LocalPlanetPosition.ToVector3();
-                    adjustedVector += (VectorLF3)Maths.QRotate(planet.runtimeRotation, localPlanetPosition);
+                    VectorLF3 adjustedVector;
+                    if (playerModel.Movement.localPlanetId > 0)
+                    {
+                        // Get the position of the planet
+                        PlanetData planet = GameMain.galaxy.PlanetById(playerModel.Movement.localPlanetId);
+                        adjustedVector = planet.uPosition;
+
+                        // Add the local position of the player
+                        Vector3 localPlanetPosition = playerModel.Movement.GetLastPosition().LocalPlanetPosition.ToVector3();
+                        adjustedVector += (VectorLF3)Maths.QRotate(planet.runtimeRotation, localPlanetPosition);
+                    }
+                    else
+                    {
+                        // Just use the raw uPos as we don't care too much about precise locations
+                        adjustedVector = playerModel.Movement.absolutePosition;
+                    }
 
                     // Scale as required
                     adjustedVector = (adjustedVector - starmap.viewTargetUPos) * 0.00025;
-                }
-                else
-                {
-                    // Just use the raw uPos as we don't care too much about precise locations
-                    adjustedVector = (playerModel.Movement.absolutePosition - starmap.viewTargetUPos) * 0.00025;
-                }
 
-                // Get the point on the screen that represents the world position
-                if (!starmap.WorldPointIntoScreen(adjustedVector, out Vector2 rectPoint))
-                {
-                    continue;
+                    // Get the point on the screen that represents the world position
+                    if (!starmap.WorldPointIntoScreen(adjustedVector, out Vector2 rectPoint))
+                    {
+                        continue;
+                    }
+
+                    // Put the marker directly on the location of the player
+                    starmapMarker.rectTransform.anchoredPosition = rectPoint;
+                    starmapMarker.transform.localScale = Vector3.one;
+
+                    // Put their name above or below it
+                    nameText.rectTransform.anchoredPosition = new Vector2(rectPoint.x, rectPoint.y + (rectPoint.y >= -350.0 ? -19f : 19f));
+                    nameText.transform.localScale = Vector3.one;
                 }
-
-                // Put the marker directly on the location of the player
-                starmapMarker.rectTransform.anchoredPosition = rectPoint;
-                nameText.transform.localScale = Vector3.one;
-
-                // Put their name above or below it
-                nameText.rectTransform.anchoredPosition = new Vector2(rectPoint.x, rectPoint.y + (rectPoint.y >= -350.0 ? -19f : 19f));
-                nameText.transform.localScale = Vector3.one;
             }
         }
 
         public static void ClearPlayerNameTagsOnStarmap()
         {
-            foreach (var player in remotePlayersModels)
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                // Destroy the marker and name so they don't linger and cause problems
-                GameObject.Destroy(player.Value.StarmapNameText.gameObject);
-                GameObject.Destroy(player.Value.StarmapMarker);
+                foreach (var player in remotePlayersModels)
+                {
+                    // Destroy the marker and name so they don't linger and cause problems
+                    GameObject.Destroy(player.Value.StarmapNameText.gameObject);
+                    GameObject.Destroy(player.Value.StarmapMarker);
 
-                // Null them out so they can be recreated next time the map is opened
-                player.Value.StarmapNameText = null;
-                player.Value.StarmapMarker = null;
+                    // Null them out so they can be recreated next time the map is opened
+                    player.Value.StarmapNameText = null;
+                    player.Value.StarmapMarker = null;
+                }
             }
         }
 
@@ -396,52 +546,59 @@ namespace NebulaWorld
         {
             TextMesh uiSailIndicator_targetText = null;
 
-            foreach (var player in remotePlayersModels)
+            using (GetRemotePlayersModels(out var remotePlayersModels))
             {
-                RemotePlayerModel playerModel = player.Value;
+                foreach (var player in remotePlayersModels)
+                {
+                    RemotePlayerModel playerModel = player.Value;
 
-                GameObject playerNameText;
-                if (playerModel.InGameNameText != null)
-                {
-                    playerNameText = playerModel.InGameNameText;
-                }
-                else
-                {
-                    // Only get the field required if we actually need to, no point getting it every time
-                    if (uiSailIndicator_targetText == null)
+                    GameObject playerNameText;
+                    if (playerModel.InGameNameText != null)
                     {
-                        uiSailIndicator_targetText = (TextMesh)AccessTools.Field(typeof(UISailIndicator), "targetText").GetValue(UIRoot.instance.uiGame.sailIndicator);
+                        playerNameText = playerModel.InGameNameText;
+                    }
+                    else
+                    {
+                        // Only get the field required if we actually need to, no point getting it every time
+                        if (uiSailIndicator_targetText == null)
+                        {
+                            uiSailIndicator_targetText = (TextMesh)AccessTools.Field(typeof(UISailIndicator), "targetText").GetValue(UIRoot.instance.uiGame.sailIndicator);
+                        }
+
+                        // Initialise a new game object to contain the text
+                        playerModel.InGameNameText = playerNameText = new GameObject();
+                        // Make it follow the player transform
+                        playerNameText.transform.SetParent(playerModel.PlayerTransform, false);
+                        // Add a meshrenderer and textmesh component to show the text with a different font
+                        MeshRenderer meshRenderer = playerNameText.AddComponent<MeshRenderer>();
+                        TextMesh textMesh = playerNameText.AddComponent<TextMesh>();
+
+                        // Set the text to be their name
+                        textMesh.text = $"{ playerModel.Username }{ playerModel.PlayerId }";
+                        // Align it to be centered below them
+                        textMesh.anchor = TextAnchor.UpperCenter;
+                        // Copy the font over from the sail indicator
+                        textMesh.font = uiSailIndicator_targetText.font;
+                        meshRenderer.sharedMaterial = uiSailIndicator_targetText.gameObject.GetComponent<MeshRenderer>().sharedMaterial;
+                        // Scale it down a little bit otherwise it looks too big when next to the player
+                        playerNameText.transform.localScale *= 0.6f;
+
+                        playerNameText.SetActive(true);
                     }
 
-                    // Initialise a new game object to contain the text
-                    playerModel.InGameNameText = playerNameText = new GameObject();
-                    // Make it follow the player transform
-                    playerNameText.transform.SetParent(playerModel.PlayerTransform, false);
-                    // Add a meshrenderer and textmesh component to show the text with a different font
-                    MeshRenderer meshRenderer = playerNameText.AddComponent<MeshRenderer>();
-                    TextMesh textMesh = playerNameText.AddComponent<TextMesh>();
+                    // If the player is not on the same planet or is in space, then do not render their in-world tag
+                    if (playerModel.Movement.localPlanetId != LocalPlayer.Data.LocalPlanetId && playerModel.Movement.localPlanetId <= 0)
+                    {
+                        playerNameText.gameObject.SetActive(false);
+                    }
+                    else if (!playerNameText.gameObject.activeSelf)
+                    {
+                        playerNameText.gameObject.SetActive(true);
+                    }
 
-                    // Set the text to be their name
-                    textMesh.text = $"{ playerModel.Username }{ playerModel.PlayerId }";
-                    // Align it to be centered below them
-                    textMesh.anchor = TextAnchor.UpperCenter;
-                    // Copy the font over from the sail indicator
-                    textMesh.font = uiSailIndicator_targetText.font;
-                    meshRenderer.sharedMaterial = uiSailIndicator_targetText.gameObject.GetComponent<MeshRenderer>().sharedMaterial;
-                    // Scale it down a little bit otherwise it looks too big when next to the player
-                    playerNameText.transform.localScale *= 0.6f;
-
-                    playerNameText.SetActive(true);
+                    // Make sure the text is pointing at the camera
+                    playerNameText.transform.rotation = GameCamera.main.transform.rotation;
                 }
-
-                // If the player is not on the same planet or is in space, then do not render their in-world tag
-                if (playerModel.Movement.localPlanetId != LocalPlayer.Data.LocalPlanetId && playerModel.Movement.localPlanetId <= 0)
-                {
-                    playerNameText.gameObject.SetActive(false);
-                }
-
-                // Make sure the text is pointing at the camera
-                playerNameText.transform.rotation = GameCamera.main.transform.rotation;                
             }
         }
     }
